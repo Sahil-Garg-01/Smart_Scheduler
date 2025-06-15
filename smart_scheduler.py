@@ -25,60 +25,48 @@ RECORD_SECONDS = 5
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CLIENT_SECRETS_FILE = "credentials.json"
 DEFAULT_DURATION = 30
+WORKDAY_START_HOUR = 9
+WORKDAY_END_HOUR = 17
+TIME_PREFERENCES = {
+    "morning": (9, 12),
+    "afternoon": (12, 17),
+    "evening": (17, 20)
+}
 
-# Load the API key from a .env file
+# Load API Key
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    print("Error: Please add your GOOGLE_API_KEY to a .env file.")
-    exit()
+    raise ValueError("GOOGLE_API_KEY not found in .env file")
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# Set up the Gemini AI model for chatting
+# Initialize Gemini AI chat
 try:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    chat = model.start_chat(history=[])
-except Exception:
-    print("Error: Could not connect to Gemini AI. Check your API key.")
-    exit()
+    chat_model = genai.GenerativeModel("gemini-1.5-flash")
+    chat = chat_model.start_chat(history=[])
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize Gemini AI: {e}")
 
-# Set up Google Calendar API
+# Google Calendar setup
 creds = None
 if os.path.exists("token.json"):
     try:
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    except Exception:
-        print("Error: Problem with token.json file. Try deleting it and re-authenticating.")
-
+    except Exception as e:
+        print(f"Invalid token.json: {e}. Delete it and try again.")
 if not creds or not creds.valid:
     if not os.path.exists(CLIENT_SECRETS_FILE):
-        print(
-            "Error: Missing credentials.json. Download it from Google Cloud Console "
-            "(https://console.cloud.google.com/apis/credentials) and place it in this folder."
-        )
-        exit()
+        raise FileNotFoundError("Missing credentials.json")
     try:
         flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
         creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
-    except Exception:
-        print("Error: Could not log in to Google Calendar. Check your setup.")
-        exit()
+    except Exception as e:
+        raise RuntimeError(f"Failed to authenticate with Google Calendar: {e}")
+calendar_service = build("calendar", "v3", credentials=creds)
 
-try:
-    calendar_service = build("calendar", "v3", credentials=creds)
-except Exception:
-    print("Error: Could not connect to Google Calendar.")
-    exit()
-
-# Store conversation details
-conversation = {
-    "duration": None,  # How long the meeting is (in minutes)
-    "day": None,       # Which day (e.g., "Tuesday")
-    "time": None,      # Preferred time (e.g., "afternoon" or "2 PM")
-    "title": None      # Meeting title
-}
+conversation = {"duration": None, "day": None, "time": None, "title": None, "attendees": None}
 
 # Audio Processing
 def speak_text(text):
@@ -114,7 +102,7 @@ def record_audio():
         return wav_io
     except Exception as e:
         print(f"Audio recording error: {e}")
-        speak_text("Failed to record audio.")
+        speak_text("Failed to record audio. Please try again.")
         return None
 
 def transcribe_audio(audio_bytes_io):
@@ -127,226 +115,20 @@ def transcribe_audio(audio_bytes_io):
             audio = recognizer.record(source)
             return recognizer.recognize_google(audio)
     except sr.UnknownValueError:
-        speak_text("Sorry, I couldn't understand that. Please try again.")
         return None
     except sr.RequestError as e:
         print(f"Speech recognition error: {e}")
-        speak_text("Speech recognition failed.")
+        speak_text("Speech recognition failed. Please try again.")
         return None
-
-def parse_time(text):
-    """Extract specific time from text (e.g., '2 PM' -> '14:00')."""
-    if not text:
-        return None
-    text = text.lower().strip()
-    time_match = re.search(
-        r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?|(\d{1,2})\s*(o\'?clock)\s*(am|pm)?|\b(noon|midnight)\b',
-        text
-    )
-    if time_match:
-        if time_match.group(7):  # Handle 'noon' or 'midnight'
-            hour = 12 if time_match.group(7) == "noon" else 0
-            minute = 0
-            return f"{hour:02d}:{minute:02d}"
-        hour = int(time_match.group(1) or time_match.group(4))
-        minute = int(time_match.group(2) or 0)
-        period = time_match.group(3) or time_match.group(6)
-        if period == "pm" and hour != 12:
-            hour += 12
-        elif period == "am" and hour == 12:
-            hour = 0
-        return f"{hour:02d}:{minute:02d}"
-    return None
 
 # Calendar Operations
-def check_calendar(start_time, end_time, duration):
-    """Check for available time slots, returning list of (start, end) tuples."""
-    try:
-        start_time = start_time.astimezone(pytz.UTC)
-        end_time = end_time.astimezone(pytz.UTC)
-        events_result = calendar_service.events().list(
-            calendarId='primary',
-            timeMin=start_time.isoformat(),
-            timeMax=end_time.isoformat(),
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        events = events_result.get('items', [])
-        free_slots = []
-        current_time = start_time
-        while current_time + datetime.timedelta(minutes=duration) <= end_time:
-            slot_end = current_time + datetime.timedelta(minutes=duration)
-            is_free = True
-            for event in events:
-                event_start = datetime.datetime.fromisoformat(event['start'].get('dateTime').replace('Z', '')).replace(tzinfo=pytz.UTC)
-                event_end = datetime.datetime.fromisoformat(event['end'].get('dateTime').replace('Z', '')).replace(tzinfo=pytz.UTC)
-                if not (slot_end <= event_start or current_time >= event_end):
-                    is_free = False
-                    break
-            if is_free:
-                free_slots.append((current_time, slot_end))
-            current_time += datetime.timedelta(minutes=30)
-        return free_slots, events
-    except HttpError as e:
-        print(f"Error: Could not access Google Calendar: {e}")
-        speak_text("Failed to check calendar.")
-        return [], []  # Return empty lists instead of None
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        speak_text("Something went wrong.")
-        return [], []  # Return empty lists instead of None
-
-def create_event(start_time, duration, title):
-    """Create a Google Calendar event."""
-    try:
-        event = {
-            "summary": title or "Meeting",
-            "start": {"dateTime": start_time.isoformat(), "timeZone": "UTC"},
-            "end": {"dateTime": (start_time + datetime.timedelta(minutes=duration)).isoformat(), "timeZone": "UTC"}
-        }
-        created = calendar_service.events().insert(calendarId="primary", body=event).execute()
-        return created
-    except HttpError as error:
-        print(f"Error creating event: {error}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error creating event: {e}")
-        return None
-
-def list_events_today():
-    """List all events scheduled for today."""
-    now = datetime.datetime.now(pytz.UTC)
-    start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_time = now.replace(hour=23, minute=59, second=59, microsecond=999999)
-    _, events = check_calendar(start_time, end_time, 1)
-    return [
-        {
-            "title": e["summary"],
-            "start": datetime.datetime.fromisoformat(e["start"].get("dateTime").replace("Z", "")).strftime("%I:%M %p"),
-            "end": datetime.datetime.fromisoformat(e["end"].get("dateTime").replace("Z", "")).strftime("%I:%M %p")
-        }
-        for e in events
-    ]
-
-def cancel_meeting_at(time_str):
-    """Cancel a meeting at the specified time within the next week."""
-    time = parse_time(time_str)
-    if not time:
-        return []
-    now = datetime.datetime.now(pytz.UTC)
-    start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_time = now + datetime.timedelta(days=7)
-    _, events = check_calendar(start_time, end_time, 1)
-    cancelled = []
-    try:
-        time_obj = datetime.datetime.strptime(time, "%H:%M")
-        for e in events:
-            event_start = datetime.datetime.fromisoformat(e["start"].get("dateTime").replace("Z", "")).replace(tzinfo=pytz.UTC)
-            if event_start.strftime("%H:%M") == time_obj.strftime("%H:%M"):
-                calendar_service.events().delete(calendarId="primary", eventId=e["id"]).execute()
-                cancelled.append({
-                    "title": e["summary"],
-                    "start": event_start.strftime("%I:%M %p")
-                })
-        return cancelled
-    except HttpError as error:
-        print(f"Error deleting event: {error}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error deleting event: {e}")
-        return None
-
-def free_slots_for_day(day_str, duration=DEFAULT_DURATION):
-    """Find free slots for a given day."""
-    target_day = get_day(day_str)
-    if not target_day:
-        return None
-    start_time = target_day.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
-    end_time = target_day.replace(hour=17, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
-    if conversation.get("time"):
-        if "afternoon" in conversation["time"].lower():
-            start_time = target_day.replace(hour=12, minute=0, tzinfo=pytz.UTC)
-        elif "morning" in conversation["time"].lower():
-            start_time = target_day.replace(hour=9, minute=0, tzinfo=pytz.UTC)
-        elif "evening" in conversation["time"].lower():
-            start_time = target_day.replace(hour=17, minute=0, tzinfo=pytz.UTC)
-        elif parse_time(conversation["time"]):
-            time = parse_time(conversation["time"])
-            time_obj = datetime.datetime.strptime(time, "%H:%M")
-            start_time = target_day.replace(hour=time_obj.hour, minute=time_obj.minute, tzinfo=pytz.UTC)
-            end_time = start_time + datetime.timedelta(hours=1)
-    free_slots, _ = check_calendar(start_time, end_time, duration)
-    return [
-        {
-            "start": slot[0].strftime("%I:%M %p"),
-            "end": slot[1].strftime("%I:%M %p")
-        }
-        for slot in free_slots
-    ] if free_slots else None
-
-# Function to understand what the user said
-def understand_input(user_input):
-    prompt = f"""
-    You are a scheduling helper. From this input, find:
-    - Meeting duration (e.g., '1 hour' = 60 minutes)
-    - Preferred day (e.g., 'Tuesday' or 'June 20th')
-    - Preferred time (e.g., 'afternoon' or '2 PM')
-    - Meeting title (e.g., 'team sync')
-    If something is missing, use null.
-    Input: "{user_input}"
-    Return JSON like this:
-    ```json
-    {{
-        "meeting_duration": <number or null>,
-        "preferred_day": <text or null>,
-        "preferred_time": <text or null>,
-        "title": <text or null>
-    }}
-    ```
-    """
-    try:
-        response = chat.send_message(prompt)
-        return json.loads(response.text.strip("```json\n").strip("\n```"))
-    except Exception as e:
-        print(f"Error: Could not understand your input: {e}")
-        speak_text("Sorry, I couldn't understand that.")
-        return {"meeting_duration": None, "preferred_day": None, "preferred_time": None, "title": None}
-
-# Function to reply to the user
-def make_reply(user_input, free_slots=None, events=None, cancelled=None, event_created=None):
-    current_state = f"Duration: {conversation['duration']}, Day: {conversation['day']}, Time: {conversation['time']}, Title: {conversation['title']}"
-    slots_info = [{"start": slot[0].strftime("%I:%M %p"), "end": slot[1].strftime("%I:%M %p")} for slot in free_slots] if free_slots else None
-    events_info = [{"title": e["summary"], "start": datetime.datetime.fromisoformat(e["start"].get("dateTime").replace("Z", "")).strftime("%I:%M %p"), "end": datetime.datetime.fromisoformat(e["end"].get("dateTime").replace("Z", "")).strftime("%I:%M %p")} for e in events]
-    cancelled_info =[{"title": c["title"], "start": c["start"]} for c in cancelled]
-    event_created_info = f"Event created: {event_created['summary']} at {event_created['start']['dateTime']}" if event_created else "No event created."
-    prompt = f"""
-    You are a friendly scheduling bot. Generate a natural, concise response based on the user input and state.
-    - For scheduling: Confirm details or ask for missing info (duration, day, time, title).
-    - For free slots: Suggest the first two slots or another day if none.
-    - For events today: List events or say none.
-    - For cancellations: Confirm cancellation or say none found.
-    - Use friendly language (e.g., "Got it! I'll schedule your team sync at 2 PM Tuesday").
-    User input: "{user_input}"
-    State: {current_state}
-    Slots: {slots_info}
-    Events: {events_info}
-    Cancelled: {cancelled_info}
-    Event created: {event_created_info}
-    """
-    try:
-        response = chat.send_message(prompt)
-        return response.text
-    except Exception:
-        speak_text("Sorry, something went wrong.")
-        return "Sorry, something went wrong."
-
-# Function to figure out which day the user means
 def get_day(day_str):
+    """Parse a day string into a datetime object."""
+    if not day_str:
+        return None
     today = datetime.datetime.now(pytz.UTC)
-    day_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2,
-        "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6
-    }
+    day_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+               "friday": 4, "saturday": 5, "sunday": 6}
     day_str = day_str.lower()
     if "today" in day_str:
         return today
@@ -355,6 +137,11 @@ def get_day(day_str):
     if "next week" in day_str:
         today += datetime.timedelta(days=7)
         day_str = day_str.replace("next week", "").strip()
+    if "next" in day_str:
+        for day in day_map:
+            if day in day_str:
+                days_ahead = (day_map[day] - today.weekday() + 7) % 7 or 7
+                return today + datetime.timedelta(days=days_ahead)
     for day, offset in day_map.items():
         if day in day_str:
             days_ahead = (offset - today.weekday() + 7) % 7
@@ -364,123 +151,344 @@ def get_day(day_str):
     except:
         return None
 
-# Main program
+def check_calendar(start_time, end_time, duration):
+    """Check for events in the given time range."""
+    try:
+        start_time = start_time.astimezone(pytz.UTC)
+        end_time = end_time.astimezone(pytz.UTC)
+        events_result = calendar_service.events().list(
+            calendarId="primary",
+            timeMin=start_time.isoformat(),
+            timeMax=end_time.isoformat(),
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        return events_result.get("items", [])
+    except HttpError as error:
+        print(f"Calendar error: {error}")
+        speak_text("Failed to access calendar. Please try again.")
+        return []
+
+def create_event(start_time, duration, title, attendees=None):
+    """Create a Google Calendar event with optional attendees."""
+    try:
+        event = {
+            "summary": title or "Meeting",
+            "start": {"dateTime": start_time.isoformat(), "timeZone": "UTC"},
+            "end": {"dateTime": (start_time + datetime.timedelta(minutes=duration)).isoformat(), "timeZone": "UTC"}
+        }
+        if attendees:
+            event["attendees"] = [{"email": email.strip()} for email in attendees.split(",") if email.strip()]
+        created = calendar_service.events().insert(calendarId="primary", body=event).execute()
+        summary = chat.send_message(
+            f"Create a friendly sentence confirming this event: {title} at {start_time.strftime('%I:%M %p')} on {start_time.strftime('%A')}"
+        ).text
+        return summary + f"\nEvent link: {created.get('htmlLink')}"
+    except HttpError as error:
+        print(f"Event creation error: {error}")
+        return f"Failed to create event: {error}"
+
+def list_events_today():
+    """List all events scheduled for today."""
+    now = datetime.datetime.utcnow().replace(tzinfo=pytz.UTC)
+    end = now.replace(hour=23, minute=59)
+    events = check_calendar(now, end, 1)
+    if not events:
+        return "You have no events scheduled for today."
+    response = "Today's meetings:\n"
+    for e in events:
+        start_time = e['start'].get('dateTime', '')
+        time = datetime.datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        response += f"- {e['summary']} at {time.strftime('%I:%M %p')}\n"
+    return response.strip()
+
+def cancel_meeting_at(time_str):
+    """Cancel a meeting at the specified time within the next week."""
+    now = datetime.datetime.utcnow().replace(tzinfo=pytz.UTC)
+    end = now + datetime.timedelta(days=7)
+    events = check_calendar(now, end, 1)
+    for e in events:
+        start_time = e['start'].get('dateTime', '')
+        event_time = datetime.datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        if time_str in event_time.strftime("%I:%M %p"):
+            try:
+                calendar_service.events().delete(calendarId='primary', eventId=e['id']).execute()
+                return f"Cancelled meeting '{e['summary']}' at {time_str}."
+            except HttpError as error:
+                print(f"Event deletion error: {error}")
+                return f"Failed to cancel meeting: {error}"
+    return "No meeting found at that time to cancel."
+
+def free_slots_for_day(day_str, duration=DEFAULT_DURATION):
+    """Find free time slots for a given day and duration."""
+    day = get_day(day_str)
+    if not day:
+        return f"Could not understand the day: {day_str}."
+    start_hour = WORKDAY_START_HOUR
+    end_hour = WORKDAY_END_HOUR
+    if conversation.get("time"):
+        for pref, (start, end) in TIME_PREFERENCES.items():
+            if pref in conversation["time"].lower():
+                start_hour, end_hour = start, end
+                break
+    start_time = day.replace(hour=start_hour, minute=0, tzinfo=pytz.UTC)
+    end_time = day.replace(hour=end_hour, minute=0, tzinfo=pytz.UTC)
+    events = check_calendar(start_time, end_time, duration)
+    busy = [(datetime.datetime.fromisoformat(e['start']['dateTime'].replace("Z", "+00:00")),
+             datetime.datetime.fromisoformat(e['end']['dateTime'].replace("Z", "+00:00"))) for e in events]
+    free_slots = []
+    current = start_time
+    while current + datetime.timedelta(minutes=duration) <= end_time:
+        slot_end = current + datetime.timedelta(minutes=duration)
+        if all(current >= b[1] or slot_end <= b[0] for b in busy):
+            free_slots.append(f"{current.strftime('%I:%M %p')} to {slot_end.strftime('%I:%M %p')}")
+        current += datetime.timedelta(minutes=30)
+    if free_slots:
+        return f"Free slots on {day_str} for {duration} minutes: {', '.join(free_slots[:2])}"
+    next_day = day + datetime.timedelta(days=1)
+    return f"No free slots on {day_str}. Try {next_day.strftime('%A')}?"
+
+# NLP and Scheduling
+def parse_duration(text):
+    """Extract duration from text in minutes."""
+    if not text:
+        return None
+    duration_match = re.search(r'(\d+)\s*(minutes?|mins?|hours?|hrs?)', text.lower())
+    if duration_match:
+        value = int(duration_match.group(1))
+        unit = duration_match.group(2).lower()
+        return value if 'min' in unit else value * 60
+    return None
+
+def parse_time(text):
+    """Extract time from text."""
+    if not text:
+        return None
+    text = text.lower().strip()
+    time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?|(\d{1,2})\s*(o\'?clock)\s*(am|pm)?', text)
+    if time_match:
+        hour = int(time_match.group(1) or time_match.group(4))
+        minute = int(time_match.group(2) or 0)
+        period = time_match.group(3) or time_match.group(6)
+        if period == "pm" and hour != 12:
+            hour += 12
+        elif period == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+    for pref in TIME_PREFERENCES:
+        if pref in text:
+            return pref
+    return None
+
+def parse_attendees(text):
+    """Extract email addresses from text."""
+    if not text:
+        return None
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    emails = re.findall(email_pattern, text)
+    return ", ".join(emails) if emails else None
+
+def parse_meeting_info(transcription):
+    """Extract meeting details using regex and Gemini AI chat."""
+    if not transcription:
+        return {}
+    info = {
+        "title": None,
+        "meeting_duration": None,
+        "preferred_day": None,
+        "preferred_time": None,
+        "attendees": None
+    }
+    text = transcription.lower()
+    # Regex-based parsing
+    info["meeting_duration"] = parse_duration(text)
+    info["preferred_time"] = parse_time(text)
+    day_match = re.search(r'(next\s+week\s+)?(?:on\s+)?(next\s+)?(\w+day|\w+)|today|tomorrow', text)
+    if day_match:
+        info["preferred_day"] = day_match.group(0).replace("on ", "").strip()
+    info["attendees"] = parse_attendees(transcription)
+    title_match = re.search(r'(?:called|about|regarding|with)\s+([a-zA-Z0-9 ]+)', text)
+    if title_match:
+        info["title"] = title_match.group(1).strip()
+    # Gemini AI fallback
+    if not all([info["title"], info["meeting_duration"], info["preferred_day"], info["preferred_time"]]):
+        try:
+            prompt = f"""
+            Extract meeting details from: '{transcription}'. Return JSON:
+            ```json
+            {{
+                "title": <text or null>,
+                "meeting_duration": <number or null>,
+                "preferred_day": <text or null>,
+                "preferred_time": <text or null>,
+                "attendees": <text or null>
+            }}
+            ```
+            """
+            response = chat.send_message(prompt)
+            gemini_info = json.loads(response.text.strip("```json\n").strip("\n```"))
+            info["title"] = info["title"] or gemini_info.get("title")
+            info["meeting_duration"] = info["meeting_duration"] or parse_duration(gemini_info.get("meeting_duration", ""))
+            info["preferred_day"] = info["preferred_day"] or gemini_info.get("preferred_day")
+            info["preferred_time"] = info["preferred_time"] or parse_time(gemini_info.get("preferred_time", ""))
+            info["attendees"] = info["attendees"] or gemini_info.get("attendees")
+        except:
+            info["title"] = info["title"] or transcription.strip()
+    return info
+
+def process_scheduling():
+    """Process and schedule a meeting based on conversation data."""
+    try:
+        day = get_day(conversation["day"])
+        if not day:
+            return "Sorry, I couldn't understand the day."
+        duration = int(conversation["duration"] or DEFAULT_DURATION)
+        start_hour = WORKDAY_START_HOUR
+        if conversation["time"]:
+            time_str = parse_time(conversation["time"])
+            if time_str in TIME_PREFERENCES:
+                start_hour = TIME_PREFERENCES[time_str][0]
+                start_time = day.replace(hour=start_hour, minute=0, tzinfo=pytz.UTC)
+                end_time = day.replace(hour=TIME_PREFERENCES[time_str][1], minute=0, tzinfo=pytz.UTC)
+                free_slots = free_slots_for_day(conversation["day"], duration)
+                if "No free slots" in free_slots:
+                    return free_slots
+                return f"Please choose a slot: {free_slots}"
+            else:
+                try:
+                    time_obj = datetime.datetime.strptime(time_str, "%H:%M")
+                    start_time = day.replace(hour=time_obj.hour, minute=time_obj.minute, tzinfo=pytz.UTC)
+                except ValueError:
+                    return "Sorry, I couldn't understand the time."
+        else:
+            start_time = day.replace(hour=start_hour, minute=0, tzinfo=pytz.UTC)
+        end_time = start_time + datetime.timedelta(minutes=duration)
+        events = check_calendar(start_time, end_time, duration)
+        if events:
+            return "There is already a meeting scheduled at that time."
+        return create_event(start_time, duration, conversation["title"], conversation["attendees"])
+    except ValueError as e:
+        return f"Invalid input: {e}"
+    except Exception as e:
+        return f"Failed to schedule meeting: {e}"
+
+def reset_conversation():
+    """Reset the conversation dictionary."""
+    global conversation
+    conversation = {"duration": None, "day": None, "time": None, "title": None, "attendees": None}
+
+# Main Loop
+def get_voice_confirmation():
+    """Get yes/no confirmation via voice."""
+    speak_text("Please say yes or no.")
+    audio_bytes = record_audio()
+    response = transcribe_audio(audio_bytes)
+    if response:
+        response = response.lower().strip()
+        if "yes" in response:
+            return "yes"
+        elif "no" in response:
+            return "no"
+    return "unknown"
+
+def is_conversation_complete():
+    """Check if all required conversation fields are filled."""
+    return all([
+        conversation.get("title"),
+        conversation.get("duration"),
+        conversation.get("day"),
+        conversation.get("time")
+    ])
+
 def main():
-    print("🔊 Smart Scheduler: Say something to start scheduling or 'exit' to quit.")
-    speak_text("Hello! Let's schedule a meeting.")
+    """Main loop for the AI Scheduler."""
+    print("🔊 AI Scheduler v3 Ready — Type 'voice' for speech, 'text' for typing, 'exit' to quit.")
     while True:
-        audio_bytes = record_audio()
-        user_input = transcribe_audio(audio_bytes)
-        if not user_input:
-            continue
-        print(f"🗣️ You said: {user_input}")
-        if user_input.lower() in ["exit", "quit"]:
-            print("Smart Scheduler: Bye!")
+        cmd = input("> ").strip().lower()
+        if cmd == "exit":
             speak_text("Goodbye!")
             break
-        lower_input = user_input.lower()
-        # Handle command shortcuts
-        if "meetings today" in lower_input:
-            events = list_events_today()
-            reply = make_reply(user_input, events=events)
-            print(f"🤖 Smart Scheduler: {reply}")
-            speak_text(reply)
-            continue
-        if "cancel" in lower_input and "meeting" in lower_input:
-            time_match = re.search(r'\d{1,2}(?::\d{2})?\s*(am|pm)|noon|midnight', lower_input)
-            if time_match:
-                time_str = time_match.group(0)
-                cancelled = cancel_meeting_at(time_str)
-                if cancelled is not None:
-                    reply = make_reply(user_input, cancelled=cancelled)
-                    print(f"🤖 Smart Scheduler: {reply}")
-                    speak_text(reply)
-                else:
-                    reply = make_reply(user_input, cancelled=[])
-                    print(f"🤖 Smart Scheduler: {reply}")
-                    speak_text("Sorry, I couldn't cancel that meeting.")
+        user_input = None
+        if cmd == "voice":
+            audio_bytes = record_audio()
+            user_input = transcribe_audio(audio_bytes)
+            if not user_input:
+                speak_text("Sorry, I didn't catch that. Please try again.")
                 continue
-        if "free slots" in lower_input or "availability" in lower_input:
-            day_match = re.search(r'(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+\w+)', lower_input)
-            duration_match = re.search(r'(\d+)\s*(hour|hours|minute|minutes)', lower_input)
-            day_str = day_match.group(0) if day_match else None
-            duration = int(duration_match.group(1)) * (60 if "hour" in duration_match.group(2) else 1) if duration_match else DEFAULT_DURATION
-            if day_str:
-                free_slots = free_slots_for_day(day_str, duration)
-                reply = make_reply(user_input, free_slots=free_slots if free_slots else [])
-                print(f"🤖 Smart Scheduler: {reply}")
-                speak_text(reply)
-            else:
-                reply = make_reply(user_input, free_slots=[])
-                print(f"🤖 Smart Scheduler: {reply}")
-                speak_text("Please specify a day, like Thursday.")
-            continue
-        # Handle scheduling
-        info = understand_input(user_input)
-        if info["meeting_duration"]:
-            conversation["duration"] = info["meeting_duration"]
-        if info["preferred_day"]:
-            conversation["day"] = info["preferred_day"]
-        if info["preferred_time"]:
-            conversation["time"] = info["preferred_time"]
-        if info["title"]:
-            conversation["title"] = info["title"]
-        if conversation["duration"] and conversation["day"] and conversation["title"] and conversation["time"]:
-            target_day = get_day(conversation["day"])
-            if target_day:
-                start_time = target_day.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
-                end_time = target_day.replace(hour=17, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
-                if conversation["time"]:
-                    time = parse_time(conversation["time"])
-                    if time:
-                        time_obj = datetime.datetime.strptime(time, "%H:%M")
-                        start_time = target_day.replace(hour=time_obj.hour, minute=time_obj.minute, tzinfo=pytz.UTC)
-                        end_time = start_time + datetime.timedelta(hours=1)
-                    elif "afternoon" in conversation["time"].lower():
-                        start_time = target_day.replace(hour=12, minute=0, tzinfo=pytz.UTC)
-                    elif "morning" in conversation["time"].lower():
-                        start_time = target_day.replace(hour=9, minute=0, tzinfo=pytz.UTC)
-                    elif "evening" in conversation["time"].lower():
-                        start_time = target_day.replace(hour=17, minute=0, tzinfo=pytz.UTC)
-                free_slots, events = check_calendar(start_time, end_time, conversation["duration"])
-                if free_slots:  # Check if slots are available
-                    event = create_event(free_slots[0][0], conversation["duration"], conversation["title"])
-                    if event:
-                        reply = make_reply(user_input, event_created=event)
-                        print(f"🤖 Smart Scheduler: {reply}")
-                        speak_text(reply)
-                        conversation.clear()
-                    else:
-                        reply = make_reply(user_input, free_slots=[{"start": s[0].strftime("%I:%M %p"), "end": s[1].strftime("%I:%M %p")} for s in free_slots[:2]])
-                        print(f"🤖 Smart Scheduler: {reply}")
-                        speak_text("Sorry, I couldn't create that event.")
-                else:
-                    next_day = target_day + datetime.timedelta(days=1)
-                    reply = make_reply(user_input, free_slots=[{"start": f"No slots on {conversation['day']}", "end": f"Try {next_day.strftime('%A')}?"}])
-                    print(f"🤖 Smart Scheduler: {reply}")
-                    speak_text(reply)
-            else:
-                reply = make_reply(user_input, free_slots=[{"start": "Invalid day", "end": "Please specify a valid day like Tuesday."}])
-                print(f"🤖 Smart Scheduler: {reply}")
-                speak_text(reply)
+        elif cmd == "text":
+            user_input = input("You: ").strip()
         else:
-            missing = []
+            print("Say 'voice', 'text', or 'exit'.")
+            continue
+        reset_conversation()
+        lower = user_input.lower()
+        if "what are my meetings today" in lower:
+            response = list_events_today()
+            print(f"🤖 {response}")
+            speak_text(response)
+            continue
+        if "cancel" in lower and "meeting" in lower:
+            time_part = lower.split("at")[-1].strip()
+            response = cancel_meeting_at(time_part)
+            print(f"🤖 {response}")
+            speak_text(response)
+            continue
+        if "free slots" in lower or "availability" in lower:
+            info = parse_meeting_info(user_input)
+            day_word = info.get("preferred_day", lower.split("for")[-1].strip())
+            duration = info.get("meeting_duration")
+            if not duration:
+                speak_text("How long should the meeting be?")
+                duration_response = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
+                duration = parse_duration(duration_response) or DEFAULT_DURATION
+            response = free_slots_for_day(day_word, duration)
+            print(f"🤖 {response}")
+            speak_text(response)
+            continue
+        info = parse_meeting_info(user_input)
+        conversation.update({
+            "title": info.get("title"),
+            "duration": info.get("meeting_duration"),
+            "day": info.get("preferred_day"),
+            "time": info.get("preferred_time"),
+            "attendees": info.get("attendees")
+        })
+        while not is_conversation_complete():
             if not conversation["title"]:
-                missing.append("title")
+                speak_text("What should I call this meeting?")
+                conversation["title"] = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
             if not conversation["duration"]:
-                missing.append("duration")
+                speak_text("How long should the meeting be?")
+                duration_response = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
+                conversation["duration"] = parse_duration(duration_response) or conversation["duration"]
             if not conversation["day"]:
-                missing.append("day")
+                speak_text("Which day should I schedule it?")
+                conversation["day"] = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
             if not conversation["time"]:
-                missing.append("time")
-            reply = make_reply(user_input, free_slots=[{"start": f"Please specify {' and '.join(missing)}", "end": ""}] if missing else [])
-            print(f"🤖 Smart Scheduler: {reply}")
-            speak_text(reply)
-            
-# Start the program
+                speak_text("What time should I schedule it?")
+                time_response = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
+                conversation["time"] = parse_time(time_response) or conversation["time"]
+        if not conversation["attendees"]:
+            speak_text("Who should I invite to this meeting? Say email addresses or none.")
+            attendees_response = transcribe_audio(record_audio()) if cmd == "voice" else input("You: ").strip()
+            conversation["attendees"] = parse_attendees(attendees_response)
+        attendees_text = f" with attendees {conversation['attendees']}" if conversation["attendees"] else ""
+        confirmation_text = f"You're scheduling '{conversation['title']}' at {conversation['time']} for {conversation['duration']} minutes{attendees_text}. Should I go ahead?"
+        print(f"🤖 {confirmation_text}")
+        speak_text(confirmation_text)
+        confirmation = get_voice_confirmation() if cmd == "voice" else input("You (yes/no): ").strip().lower()
+        if confirmation == "yes":
+            speak_text("Your meeting has been scheduled successfully.")
+            reset_conversation()
+        elif confirmation == "no":
+            speak_text("Okay, I won’t schedule it.")
+        else:
+            speak_text("Sorry, I couldn't understand your confirmation. Please try again.")
+        reset_conversation()
+
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         print(f"Oops! Something broke: {e}")
-        speak_text("Something went wrong.")
+        speak_text("Something went wrong. Please try again.")
