@@ -2,5 +2,5 @@
 venv/
 __pycache__/
 PyAudio-0.2.14/
-credentiasls.json
+credentials.json
 token.json

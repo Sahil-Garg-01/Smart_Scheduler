@@ -12,6 +12,8 @@ from deepgram import DeepgramClient
 import google.generativeai as genai
 import uuid
 import aiohttp
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/calendar']
